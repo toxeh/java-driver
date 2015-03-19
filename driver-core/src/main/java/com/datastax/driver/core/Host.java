@@ -39,16 +39,13 @@ public class Host {
 
     private final InetSocketAddress address;
 
-    enum State { ADDED, DOWN, SUSPECT, UP }
+    enum State { ADDED, DOWN, UP }
     volatile State state;
     /** Ensures state change notifications for that host are handled serially */
     final ReentrantLock notificationsLock = new ReentrantLock(true);
 
     private final ConvictionPolicy policy;
     private final Cluster.Manager manager;
-
-    // Tracks the first "immediate" reconnection attempt when a node get suspected.
-    final AtomicReference<ListenableFuture<?>> initialReconnectionAttempt = new AtomicReference<ListenableFuture<?>>(Futures.immediateFuture(null));
 
     // Tracks later reconnection attempts to that host so we avoid adding multiple tasks.
     final AtomicReference<ListenableFuture<?>> reconnectionAttempt = new AtomicReference<ListenableFuture<?>>();
@@ -188,7 +185,7 @@ public class Host {
     public boolean isUp() {
         // Consider a suspected host UP until proved otherwise to avoid
         // having the status flapping if it turns out the host is not really down.
-        return state == State.UP || state == State.SUSPECT;
+        return state == State.UP;
     }
 
     /**
@@ -199,9 +196,13 @@ public class Host {
      * we are trying suspected nodes.
      *
      * @return the future.
+     *
+     * @deprecated the suspicion mechanism has been disabled. This will always return
+     * a completed future.
      */
+    @Deprecated
     public ListenableFuture<?> getInitialReconnectionAttemptFuture() {
-        return initialReconnectionAttempt.get();
+        return Futures.immediateFuture(null);
     }
 
     /**
@@ -269,14 +270,6 @@ public class Host {
         state = State.UP;
     }
 
-    boolean setSuspected() {
-        if (state != State.UP)
-            return false;
-
-        state = State.SUSPECT;
-        return true;
-    }
-
     boolean signalConnectionFailure(ConnectionException exception) {
         return policy.addFailure(exception);
     }
@@ -326,7 +319,11 @@ public class Host {
          * that is suspected down turns out to be truly down (that is, the driver
          * cannot successfully connect to it right away), then {@link onDown} will
          * be called.
+         *
+         * @deprecated the suspicion mechanism has been disabled. This will never
+         * get called.
          */
+        @Deprecated
         public void onSuspected(Host host);
 
         /**
