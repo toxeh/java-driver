@@ -595,12 +595,7 @@ class RequestHandler implements Connection.ResponseCallback {
 
         Host queriedHost = current;
         try {
-            // If a query times out, we consider that the host is unstable, so we defunct
-            // the connection to mark it down.
-            DriverException timeoutException = new DriverException("Timed out waiting for server response");
-            connection.defunct(timeoutException);
-
-            logError(connection.address, timeoutException);
+            logError(connection.address, new DriverException("Timed out waiting for server response"));
             retry(false, null);
         } catch (Exception e) {
             // This shouldn't happen, but if it does, we want to signal the callback, not let him hang indefinitively
