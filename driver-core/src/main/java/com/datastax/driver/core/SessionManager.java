@@ -477,6 +477,9 @@ class SessionManager extends AbstractSession {
             usedPagingState = statement.getPagingState();
         }
 
+        if (statement instanceof StatementWrapper)
+            statement = ((StatementWrapper)statement).getWrappedStatement();
+
         if (statement instanceof RegularStatement) {
             RegularStatement rs = (RegularStatement)statement;
 
