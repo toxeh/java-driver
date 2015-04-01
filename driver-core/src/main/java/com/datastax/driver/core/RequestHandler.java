@@ -312,8 +312,7 @@ class RequestHandler {
             while (true) {
                 QueryState previous = queryStateRef.get();
                 if (previous.isCancelled()) {
-                    if (connection instanceof PooledConnection)
-                        ((PooledConnection)connection).release();
+                    release(connection);
                     return;
                 }
                 if (previous.inProgress || queryStateRef.compareAndSet(previous, previous.startNext()))
@@ -399,12 +398,11 @@ class RequestHandler {
             }
 
             Host queriedHost = current;
-
-            boolean releaseConnection = true;
             Exception exceptionToReport = null;
             try {
                 switch (response.type) {
                     case RESULT:
+                        release(connection);
                         setFinalResult(connection, response);
                         break;
                     case ERROR:
@@ -416,6 +414,7 @@ class RequestHandler {
                             : statement.getRetryPolicy();
                         switch (err.code) {
                             case READ_TIMEOUT:
+                                release(connection);
                                 assert err.infos instanceof ReadTimeoutException;
                                 if (metricsEnabled())
                                     metrics().getErrorMetrics().getReadTimeouts().inc();
@@ -436,6 +435,7 @@ class RequestHandler {
                                 }
                                 break;
                             case WRITE_TIMEOUT:
+                                release(connection);
                                 assert err.infos instanceof WriteTimeoutException;
                                 if (metricsEnabled())
                                     metrics().getErrorMetrics().getWriteTimeouts().inc();
@@ -456,6 +456,7 @@ class RequestHandler {
                                 }
                                 break;
                             case UNAVAILABLE:
+                                release(connection);
                                 assert err.infos instanceof UnavailableException;
                                 if (metricsEnabled())
                                     metrics().getErrorMetrics().getUnavailables().inc();
@@ -475,6 +476,7 @@ class RequestHandler {
                                 }
                                 break;
                             case OVERLOADED:
+                                release(connection);
                                 // Try another node
                                 logger.warn("Host {} is overloaded, trying next host.", connection.address);
                                 DriverException overloaded = new DriverException("Host overloaded");
@@ -484,6 +486,7 @@ class RequestHandler {
                                 retry(false, null);
                                 return;
                             case SERVER_ERROR:
+                                release(connection);
                                 // Defunct connection and try another node
                                 logger.warn("{} replied with server error ({}), trying next host.", connection.address, err.message);
                                 DriverException exception = new DriverException("Host replied with server error: " + err.message);
@@ -494,6 +497,7 @@ class RequestHandler {
                                 retry(false, null);
                                 return;
                             case IS_BOOTSTRAPPING:
+                                release(connection);
                                 // Try another node
                                 logger.error("Query sent to {} but it is bootstrapping. This shouldn't happen but trying next host.", connection.address);
                                 DriverException bootstrapping = new DriverException("Host is bootstrapping");
@@ -503,11 +507,13 @@ class RequestHandler {
                                 retry(false, null);
                                 return;
                             case UNPREPARED:
+                                // Do not release connection yet, because we might reuse it to send the PREPARE message (see write() call below)
                                 assert err.infos instanceof MD5Digest;
                                 MD5Digest id = (MD5Digest)err.infos;
                                 PreparedStatement toPrepare = manager.cluster.manager.preparedQueries.get(id);
                                 if (toPrepare == null) {
                                     // This shouldn't happen
+                                    release(connection);
                                     String msg = String.format("Tried to execute unknown prepared query %s", id);
                                     logger.error(msg);
                                     setFinalException(connection, new DriverInternalError(msg));
@@ -521,6 +527,7 @@ class RequestHandler {
                                     // a prepared statement with the wrong keyspace set.
                                     // Fail fast (we can't change the keyspace to reprepare, because we're using a pooled connection
                                     // that's shared with other requests).
+                                    release(connection);
                                     throw new IllegalStateException(String.format("Statement was prepared on keyspace %s, can't execute it on %s (%s)",
                                         toPrepare.getQueryKeyspace(), connection.keyspace(), toPrepare.getQueryString()));
                                 }
@@ -529,11 +536,11 @@ class RequestHandler {
                                         + "Seeing this message a few times is fine, but seeing it a lot may be source of performance problems",
                                     toPrepare.getQueryString(), connection.address);
 
-                                releaseConnection = false; // we're reusing it for the prepare call
                                 write(connection, prepareAndRetry(toPrepare.getQueryString()));
                                 // we're done for now, the prepareAndRetry callback will handle the rest
                                 return;
                             default:
+                                release(connection);
                                 if (metricsEnabled())
                                     metrics().getErrorMetrics().getOthers().inc();
                                 break;
@@ -563,6 +570,7 @@ class RequestHandler {
                         }
                         break;
                     default:
+                        release(connection);
                         setFinalResult(connection, response);
                         break;
                 }
@@ -570,9 +578,6 @@ class RequestHandler {
                 exceptionToReport = e;
                 setFinalException(connection, e);
             } finally {
-                if (releaseConnection && connection instanceof PooledConnection)
-                    ((PooledConnection)connection).release();
-
                 if (queriedHost != null && statement != Statement.DEFAULT)
                     manager.cluster.manager.reportLatency(queriedHost, statement, exceptionToReport, latency);
             }
@@ -601,8 +606,7 @@ class RequestHandler {
                         return;
                     }
 
-                    if (connection instanceof PooledConnection)
-                        ((PooledConnection)connection).release();
+                    release(connection);
 
                     // TODO should we check the response ?
                     switch (response.type) {
@@ -661,8 +665,7 @@ class RequestHandler {
 
             Host queriedHost = current;
             try {
-                if (connection instanceof PooledConnection)
-                    ((PooledConnection)connection).release();
+                release(connection);
 
                 if (exception instanceof ConnectionException) {
                     if (metricsEnabled())
@@ -680,6 +683,11 @@ class RequestHandler {
                 if (queriedHost != null && statement != Statement.DEFAULT)
                     manager.cluster.manager.reportLatency(queriedHost, statement, exception, latency);
             }
+        }
+
+        private void release(Connection connection) {
+            if (connection instanceof PooledConnection)
+                ((PooledConnection)connection).release();
         }
 
         @Override
