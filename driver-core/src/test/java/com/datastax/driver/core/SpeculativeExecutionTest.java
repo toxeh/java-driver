@@ -1,168 +1,189 @@
 package com.datastax.driver.core;
 
-import java.util.Collection;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.*;
+import java.util.concurrent.ConcurrentSkipListSet;
 
-import com.codahale.metrics.Counter;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Lists;
-import org.scassandra.Scassandra;
-import org.scassandra.ScassandraFactory;
-import org.scassandra.http.client.PrimingClient;
+import com.google.common.primitives.UnsignedBytes;
 import org.scassandra.http.client.PrimingRequest;
-import org.testng.annotations.AfterClass;
-import org.testng.annotations.BeforeClass;
-import org.testng.annotations.Test;
+import org.testng.annotations.*;
 
-import com.datastax.driver.core.exceptions.SyntaxError;
 import com.datastax.driver.core.policies.ConstantSpeculativeExecutionPolicy;
-import com.datastax.driver.core.policies.DowngradingConsistencyRetryPolicy;
 import com.datastax.driver.core.policies.LoadBalancingPolicy;
+import com.datastax.driver.core.policies.RetryPolicy;
 
 import static com.datastax.driver.core.Assertions.assertThat;
 
 public class SpeculativeExecutionTest {
-    CCMBridge ccm = null;
-    Scassandra scassandra = null;
+    SCassandraCluster scassandras;
+
     Cluster cluster = null;
-    SortableLoadBalancingPolicy loadBalancingPolicy;
+    SortingLoadBalancingPolicy loadBalancingPolicy;
+    Metrics.Errors errors;
+    Host host1, host2, host3;
     Session session;
-    PrimingClient mockHost1;
-    Counter speculativeExecutions;
 
     @BeforeClass(groups = "short")
-    public void setup() {
-        // Start a regular CCM cluster and stop host1
-        String clusterName = "speculative_execution";
-        ccm = CCMBridge.create(clusterName, 3);
-        ccm.stop(1);
-        ccm.waitForDown(1);
+    public void beforeClass() {
+        scassandras = new SCassandraCluster(CCMBridge.IP_PREFIX, 3);
+    }
 
-        // Put an SCassandra instance in host1's place
-        String address = CCMBridge.ipOfNode(1);
-        scassandra = ScassandraFactory.createServer(address, 9042, address, TestUtils.findAvailablePort(9043));
-        scassandra.start();
-        mockHost1 = PrimingClient.builder()
-            .withHost(address).withPort(scassandra.getAdminPort())
-            .build();
+    @BeforeMethod(groups = "short")
+    public void beforeMethod() {
+        int speculativeExecutionDelay = 200;
 
-        // Mock cluster name since it will be checked when the driver tries to connect
-        mockHost1.prime(
-            PrimingRequest.queryBuilder()
-                .withQuery("select cluster_name from system.local")
-                .withRows(ImmutableMap.of("cluster_name", clusterName))
-                .build()
-        );
-
-        // Use a relatively large delay for the scenarios where we want retries before the next speculative execution is triggered
-        int speculativeExecutionDelay = 500;
-
-        loadBalancingPolicy = new SortableLoadBalancingPolicy();
+        loadBalancingPolicy = new SortingLoadBalancingPolicy();
         cluster = Cluster.builder()
             .addContactPoint(CCMBridge.ipOfNode(2))
             .withLoadBalancingPolicy(loadBalancingPolicy)
             .withSpeculativeExecutionPolicy(new ConstantSpeculativeExecutionPolicy(1, speculativeExecutionDelay))
-            .withRetryPolicy(DowngradingConsistencyRetryPolicy.INSTANCE)
+            .withRetryPolicy(new CustomRetryPolicy())
             .build();
 
-        speculativeExecutions = cluster.getMetrics().getErrorMetrics().getSpeculativeExecutions();
-
         session = cluster.connect();
-        loadBalancingPolicy.order = ImmutableList.of(2, 3, 1);
 
-        session.execute("create keyspace test with replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
-        session.execute("use test");
-        session.execute("create table foo(k int primary key, v text)");
-        session.execute("insert into foo (k, v) values (1, 'value from real host')");
+        host1 = TestUtils.findHost(cluster, 1);
+        host2 = TestUtils.findHost(cluster, 2);
+        host3 = TestUtils.findHost(cluster, 3);
+
+        errors = cluster.getMetrics().getErrorMetrics();
     }
 
     @Test(groups = "short")
     public void should_not_start_speculative_execution_if_first_execution_completes_successfully() {
-        loadBalancingPolicy.order = ImmutableList.of(2, 3, 1);
-        long startCount = speculativeExecutions.getCount();
+        scassandras.prime(1, PrimingRequest.queryBuilder()
+                .withQuery("mock query")
+                .withRows(row("result", "result1"))
+                .build()
+        );
 
-        ResultSet rs = session.execute("select v from foo where k = 1");
+        long execStartCount = errors.getSpeculativeExecutions().getCount();
+
+        ResultSet rs = session.execute("mock query");
         Row row = rs.one();
 
-        assertThat(row.getString("v")).isEqualTo("value from real host");
-        assertThat(speculativeExecutions.getCount()).isEqualTo(startCount);
-        assertThat(rs.getExecutionInfo().getQueriedHost()).isEqualTo(TestUtils.findHost(cluster, 2));
-    }
-
-    @Test(groups = "short")
-    public void should_not_start_speculative_execution_if_first_execution_completes_with_error() {
-        loadBalancingPolicy.order = ImmutableList.of(2, 3, 1);
-        long startCount = speculativeExecutions.getCount();
-
-        try {
-            session.execute("select v from foo where k"); // syntax error
-        } catch (SyntaxError error) { /* expected */ }
-
-        assertThat(speculativeExecutions.getCount()).isEqualTo(startCount);
+        assertThat(row.getString("result")).isEqualTo("result1");
+        assertThat(errors.getSpeculativeExecutions().getCount()).isEqualTo(execStartCount);
+        assertThat(rs.getExecutionInfo().getQueriedHost()).isEqualTo(host1);
     }
 
     @Test(groups = "short")
     public void should_not_start_speculative_execution_if_first_execution_retries_but_is_still_fast_enough() {
-        loadBalancingPolicy.order = ImmutableList.of(2, 3, 1);
-        Counter retriesOnUnavailable = cluster.getMetrics().getErrorMetrics().getRetriesOnUnavailable();
-        long startCount = speculativeExecutions.getCount();
-        long retriesStartCount = retriesOnUnavailable.getCount();
+        // will retry once on this node:
+        scassandras.prime(1, PrimingRequest.queryBuilder()
+                .withQuery("mock query")
+                .withConsistency(PrimingRequest.Consistency.TWO)
+                .withResult(PrimingRequest.Result.read_request_timeout)
+                .build()
+        ).prime(1, PrimingRequest.queryBuilder()
+                .withQuery("mock query")
+                .withConsistency(PrimingRequest.Consistency.ONE)
+                .withRows(row("result", "result1"))
+                .build()
+        );
 
-        SimpleStatement statement = new SimpleStatement("select v from foo where k = 1");
-        // This will fail because our keyspace has RF = 1, but we use the downgrading retry policy so there should be one retry.
+        long execStartCount = errors.getSpeculativeExecutions().getCount();
+        long retriesStartCount = errors.getRetriesOnUnavailable().getCount();
+
+        SimpleStatement statement = new SimpleStatement("mock query");
         statement.setConsistencyLevel(ConsistencyLevel.TWO);
         ResultSet rs = session.execute(statement);
         Row row = rs.one();
 
-        assertThat(row.getString("v")).isEqualTo("value from real host");
-        assertThat(speculativeExecutions.getCount()).isEqualTo(startCount);
-        assertThat(retriesOnUnavailable.getCount()).isEqualTo(retriesStartCount + 1);
-        assertThat(rs.getExecutionInfo().getQueriedHost()).isEqualTo(TestUtils.findHost(cluster, 2));
+        assertThat(row.getString("result")).isEqualTo("result1");
+        assertThat(errors.getSpeculativeExecutions().getCount()).isEqualTo(execStartCount);
+        assertThat(errors.getRetriesOnReadTimeout().getCount()).isEqualTo(retriesStartCount + 1);
+        assertThat(rs.getExecutionInfo().getQueriedHost()).isEqualTo(host1);
     }
 
     @Test(groups = "short")
     public void should_start_speculative_execution_if_first_execution_takes_too_long() {
-        loadBalancingPolicy.order = ImmutableList.of(1, 2, 3);
-        mockHost1.prime(
-            PrimingRequest.queryBuilder()
-                .withQuery("select v from foo where k = 1")
-                .withFixedDelay(2000)
-                .withRows(ImmutableMap.of("v", "mock value from host1"))
+        scassandras.prime(1, PrimingRequest.queryBuilder()
+                .withQuery("mock query")
+                .withFixedDelay(400)
+                .withRows(row("result", "result1"))
+                .build()
+        ).prime(2, PrimingRequest.queryBuilder()
+                .withQuery("mock query")
+                .withRows(row("result", "result2"))
                 .build()
         );
-        long startCount = speculativeExecutions.getCount();
+        long execStartCount = errors.getSpeculativeExecutions().getCount();
 
-        ResultSet rs = session.execute("select v from foo where k = 1");
+        ResultSet rs = session.execute("mock query");
         Row row = rs.one();
 
-        assertThat(row.getString("v")).isEqualTo("value from real host");
-        assertThat(speculativeExecutions.getCount()).isEqualTo(startCount + 1);
-        assertThat(rs.getExecutionInfo().getQueriedHost()).isEqualTo(TestUtils.findHost(cluster, 2));
+        assertThat(row.getString("result")).isEqualTo("result2");
+        assertThat(errors.getSpeculativeExecutions().getCount()).isEqualTo(execStartCount + 1);
+        assertThat(rs.getExecutionInfo().getQueriedHost()).isEqualTo(host2);
+    }
+
+    @Test(groups = "short")
+    public void should_wait_until_all_executions_have_finished() {
+        // Rely on read timeouts to trigger errors that cause an execution to move to the next node
+        cluster.getConfiguration().getSocketOptions().setReadTimeoutMillis(1000);
+
+        scassandras
+            // execution1 starts with host1, which will time out at t=1000
+            .prime(1, PrimingRequest.queryBuilder()
+                .withQuery("mock query")
+                .withFixedDelay(2000)
+                .withRows(row("result", "result1"))
+                .build())
+                // at t=1000, execution1 moves to host3, which eventually succeeds at t=1500
+            .prime(3, PrimingRequest.queryBuilder()
+                .withQuery("mock query")
+                .withFixedDelay(500)
+                .withRows(row("result", "result3"))
+                .build())
+                // meanwhile, execution2 starts at t=200, using host2 which times out at t=1200
+                // at that time, the query plan is empty so execution2 fails
+                // The goal of this test is to check that execution2 does not fail the query, since execution1 is still running
+            .prime(2, PrimingRequest.queryBuilder()
+                .withQuery("mock query")
+                .withFixedDelay(2000)
+                .withRows(row("result", "result2"))
+                .build());
+        long execStartCount = errors.getSpeculativeExecutions().getCount();
+
+        ResultSet rs = session.execute("mock query");
+        Row row = rs.one();
+
+        assertThat(row.getString("result")).isEqualTo("result3");
+        assertThat(errors.getSpeculativeExecutions().getCount()).isEqualTo(execStartCount + 1);
+        assertThat(rs.getExecutionInfo().getQueriedHost()).isEqualTo(host3);
+    }
+
+    @AfterMethod(groups = "short")
+    public void afterMethod() {
+        scassandras.clearAllPrimes();
+        if (cluster != null)
+            cluster.close();
     }
 
     @AfterClass(groups = "short")
-    public void teardown() {
-        if (cluster != null)
-            cluster.close();
-        if (scassandra != null)
-            scassandra.stop();
-        if (ccm != null)
-            ccm.remove();
+    public void afterClass() {
+        if (scassandras != null)
+            scassandras.stop();
     }
 
     /**
-     * A load balancing policy where the order of the query plan can be customized based
-     * on the last byte of the address.
+     * A load balancing policy that sorts hosts on the last byte of the address,
+     * so that the query plan is always [host1, host2, host3].
      */
-    static class SortableLoadBalancingPolicy implements LoadBalancingPolicy {
+    static class SortingLoadBalancingPolicy implements LoadBalancingPolicy {
 
-        volatile List<Integer> order = ImmutableList.of(1, 2, 3);
-
-        private final Set<Host> hosts = new CopyOnWriteArraySet<Host>();
+        private final SortedSet<Host> hosts = new ConcurrentSkipListSet<Host>(new Comparator<Host>() {
+            @Override
+            public int compare(Host host1, Host host2) {
+                byte[] address1 = host1.getAddress().getAddress();
+                byte[] address2 = host2.getAddress().getAddress();
+                return UnsignedBytes.compare(
+                    address1[address1.length - 1],
+                    address2[address2.length - 1]);
+            }
+        });
 
         @Override
         public void init(Cluster cluster, Collection<Host> hosts) {
@@ -176,19 +197,7 @@ public class SpeculativeExecutionTest {
 
         @Override
         public Iterator<Host> newQueryPlan(String loggedKeyspace, Statement statement) {
-            Host[] queryPlan = new Host[order.size()];
-            int i = 0;
-            for (Integer lastByte : order) {
-                for (Host host : hosts) {
-                    byte[] address = host.getAddress().getAddress();
-                    if (address[address.length - 1] == lastByte) {
-                        queryPlan[i] = host;
-                        break;
-                    }
-                }
-                i += 1;
-            }
-            return Lists.newArrayList(queryPlan).iterator();
+            return hosts.iterator();
         }
 
         @Override
@@ -214,5 +223,32 @@ public class SpeculativeExecutionTest {
         @Override
         public void onSuspected(Host host) {
         }
+    }
+
+    /**
+     * Custom retry policy that retries at ONE on read timeout.
+     * This deals with the fact that Scassandra only allows read timeouts with 0 replicas.
+     */
+    static class CustomRetryPolicy implements RetryPolicy {
+        @Override
+        public RetryDecision onReadTimeout(Statement statement, ConsistencyLevel cl, int requiredResponses, int receivedResponses, boolean dataRetrieved, int nbRetry) {
+            if (nbRetry != 0)
+                return RetryDecision.rethrow();
+            return RetryDecision.retry(ConsistencyLevel.ONE);
+        }
+
+        @Override
+        public RetryDecision onWriteTimeout(Statement statement, ConsistencyLevel cl, WriteType writeType, int requiredAcks, int receivedAcks, int nbRetry) {
+            return RetryDecision.rethrow();
+        }
+
+        @Override
+        public RetryDecision onUnavailable(Statement statement, ConsistencyLevel cl, int requiredReplica, int aliveReplica, int nbRetry) {
+            return RetryDecision.rethrow();
+        }
+    }
+
+    private static List<Map<String, ?>> row(String key, String value) {
+        return ImmutableList.<Map<String, ?>>of(ImmutableMap.of(key, value));
     }
 }
