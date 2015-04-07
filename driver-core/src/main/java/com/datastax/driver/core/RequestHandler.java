@@ -117,7 +117,7 @@ class RequestHandler {
     private final TimerTask newExecutionTask = new TimerTask() {
         @Override
         public void run(final Timeout timeout) throws Exception {
-            // We're on an I/O thread so reschedule to another executor
+            // We're on the timer thread so reschedule to another executor
             manager.executor().execute(new Runnable() {
                 @Override
                 public void run() {
