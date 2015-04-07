@@ -49,8 +49,8 @@ class RequestHandler {
 
     private final Iterator<Host> queryPlan;
     private final SpeculativeExecutionPlan speculativeExecutionPlan;
-    private final Set<SpeculativeExecution> runningExecutions = Sets.newHashSet();
-    private final Set<Timeout> scheduledExecutions = Sets.newHashSet();
+    private final Set<SpeculativeExecution> runningExecutions = Sets.newCopyOnWriteArraySet();
+    private final Set<Timeout> scheduledExecutions = Sets.newCopyOnWriteArraySet();
     private final Statement statement;
     private final HashedWheelTimer scheduler;
 
