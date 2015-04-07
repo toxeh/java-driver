@@ -224,7 +224,6 @@ class RequestHandler {
     class SpeculativeExecution implements Connection.ResponseCallback {
         final String id;
         private volatile Host current;
-        private volatile HostConnectionPool currentPool;
         private volatile ConsistencyLevel retryConsistencyLevel;
         private final AtomicReference<QueryState> queryStateRef;
         private final AtomicBoolean nextExecutionScheduled = new AtomicBoolean();
@@ -259,7 +258,7 @@ class RequestHandler {
         }
 
         private boolean query(final Host host) {
-            currentPool = manager.pools.get(host);
+            HostConnectionPool currentPool = manager.pools.get(host);
             if (currentPool == null || currentPool.isClosed())
                 return false;
 
