@@ -1082,7 +1082,7 @@ public class Cluster implements Closeable {
         @Override
         public Configuration getConfiguration() {
             Policies policies = new Policies(
-                Objects.firstNonNull(loadBalancingPolicy, Policies.defaultLoadBalancingPolicy()),
+                loadBalancingPolicy == null ? Policies.defaultLoadBalancingPolicy() : loadBalancingPolicy,
                 Objects.firstNonNull(reconnectionPolicy, Policies.defaultReconnectionPolicy()),
                 Objects.firstNonNull(retryPolicy, Policies.defaultRetryPolicy()),
                 Objects.firstNonNull(addressTranslater, Policies.defaultAddressTranslater()),
