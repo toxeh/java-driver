@@ -67,6 +67,12 @@ class Connection {
 
     private static final boolean DISABLE_COALESCING = SystemProperties.getBoolean("com.datastax.driver.DISABLE_COALESCING", false);
 
+    enum State {OPEN, TRASHED, RESURRECTING, GONE }
+
+    final AtomicReference<State> state = new AtomicReference<State>(State.OPEN);
+
+    volatile long maxIdleTime;
+
     public final InetSocketAddress address;
     private final String name;
 
@@ -86,15 +92,23 @@ class Connection {
     final ListenableFuture<Void> initFuture;
     private final AtomicReference<ConnectionCloseFuture> closeFuture = new AtomicReference<ConnectionCloseFuture>();
 
+    private final AtomicReference<HostConnectionPool> poolRef = new AtomicReference<HostConnectionPool>();
+
+    /** The instant when the connection should be trashed after being idle for too long */
+    private volatile long trashTime = Long.MAX_VALUE;
+
     /**
-     * Create a new connection to a Cassandra node.
+     * Create a new connection to a Cassandra node and associate it with a pool.
      *
      * The connection is open and initialized by the constructor.
+     *
+     * Note that an existing connection can also be associated to a pool later with {@link #setPool(HostConnectionPool)}.
      */
-    protected Connection(String name, InetSocketAddress address, Factory factory) {
+    protected Connection(String name, InetSocketAddress address, Factory factory, HostConnectionPool pool) {
         this.address = address;
         this.factory = factory;
         this.name = name;
+        this.poolRef.set(pool);
 
         int protocolVersion = factory.protocolVersion == 1 ? 1 : 2;
         final SettableFuture<Void> channelReadyFuture = SettableFuture.create();
@@ -144,6 +158,13 @@ class Connection {
                 closeAsync().force();
             }
         }, executor);
+    }
+
+    /**
+     * Create a new connection to a Cassandra node.
+     */
+    Connection(String name, InetSocketAddress address, Factory factory) {
+        this(name, address, factory, null);
     }
 
     private static String extractMessage(Throwable t) {
@@ -341,9 +362,9 @@ class Connection {
             // If the host was reconnecting, and this error happens right after we opened a connection pool, but
             // before we could mark the node UP, we don't want to go through the SUSPECTED state, because that can
             // lead to a race condition that leaves the node UP with a closed pool.
+            HostConnectionPool pool = this.poolRef.get();
             boolean belongsToReconnectingPool = host.state != Host.State.UP &&
-                this instanceof PooledConnection &&
-                (((PooledConnection)this).pool == null || !((PooledConnection)this).pool.isClosed());
+                (pool == null || !pool.isClosed());
 
             boolean markSuspected = initFuture.isDone() && !belongsToReconnectingPool;
 
@@ -362,6 +383,15 @@ class Connection {
     }
 
     protected void notifyOwnerWhenDefunct(boolean hostIsDown) {
+        HostConnectionPool pool = this.poolRef.get();
+        if (pool == null)
+            return;
+
+        if (hostIsDown) {
+            pool.closeAsync().force();
+        } else {
+            pool.replaceDefunctConnection(this);
+        }
     }
 
     public String keyspace() {
@@ -510,6 +540,37 @@ class Connection {
         };
     }
 
+    boolean hasPool() {
+        return this.poolRef.get() != null;
+    }
+
+    /** @return whether the connection was already associated with a pool */
+    boolean setPool(HostConnectionPool pool) {
+        return poolRef.compareAndSet(null, pool);
+    }
+
+    /**
+     * If the connection is part of a pool, return it to the pool.
+     * The connection should generally not be reused after that.
+     */
+    void release() {
+        HostConnectionPool pool = poolRef.get();
+        if (pool != null)
+            pool.returnConnection(this);
+    }
+
+    long getTrashTime() {
+        return trashTime;
+    }
+
+    void cancelTrashTime() {
+        trashTime = Long.MAX_VALUE;
+    }
+
+    void setTrashTimeIn(int timeoutSeconds) {
+        trashTime = System.currentTimeMillis() + 1000 * timeoutSeconds;
+    }
+    
     public boolean isClosed() {
         return closeFuture.get() != null;
     }
@@ -646,7 +707,7 @@ class Connection {
         /**
          * Same as open, but associate the created connection to the provided connection pool.
          */
-        public PooledConnection open(HostConnectionPool pool) throws ConnectionException, InterruptedException, UnsupportedProtocolVersionException, ClusterNameMismatchException {
+        public Connection open(HostConnectionPool pool) throws ConnectionException, InterruptedException, UnsupportedProtocolVersionException, ClusterNameMismatchException {
             try {
                 return openAsync(pool).get();
             } catch (ExecutionException e) {
@@ -657,7 +718,7 @@ class Connection {
         /**
          * Same as open, but initializes the connection asynchronously.
          */
-        public ListenableFuture<PooledConnection> openAsync(HostConnectionPool pool) {
+        public ListenableFuture<Connection> openAsync(HostConnectionPool pool) {
             InetSocketAddress address = pool.host.getSocketAddress();
 
             if (isShutdown)
@@ -665,10 +726,10 @@ class Connection {
 
             String name = address.toString() + '-' + getIdGenerator(pool.host).getAndIncrement();
 
-            final PooledConnection connection = new PooledConnection(name, address, this, pool);
-            return Futures.transform(connection.initFuture, new Function<Void, PooledConnection>() {
+            final Connection connection = new Connection(name, address, this, pool);
+            return Futures.transform(connection.initFuture, new Function<Void, Connection>() {
                 @Override
-                public PooledConnection apply(Void input) {
+                public Connection apply(Void input) {
                     return connection;
                 }
             });
@@ -819,7 +880,7 @@ class Connection {
     }
 
     private static final ConcurrentMap<EventLoop, Flusher> flusherLookup = new MapMaker()
-            .concurrencyLevel(16)
+        .concurrencyLevel(16)
             .weakKeys()
             .makeMap();
 
@@ -1156,8 +1217,7 @@ class Connection {
             // were, a new request could reuse that ID but get the answer to the request we just gave up on instead
             // of its own answer, and we would have no way to detect that.
             connection.dispatcher.removeHandler(this, false);
-            if (connection instanceof PooledConnection)
-                ((PooledConnection)connection).release();
+            connection.release();
         }
 
         private TimerTask onTimeoutTask() {

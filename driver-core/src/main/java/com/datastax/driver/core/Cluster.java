@@ -26,7 +26,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Predicates;
 import com.google.common.collect.*;
 import com.google.common.util.concurrent.*;
 
@@ -1404,21 +1403,21 @@ public class Cluster implements Closeable {
             return executor.submit(new ExceptionCatchingRunnable() {
                 @Override
                 public void runMayThrow() throws InterruptedException, ExecutionException {
-                    onUp(host);
+                    onUp(host, null);
                 }
             });
         }
 
-        private void onUp(final Host host) throws InterruptedException, ExecutionException {
+        private void onUp(final Host host, Connection preExistentConnection) throws InterruptedException, ExecutionException {
             // Note that in generalize we can parallelize the pool creation on
             // each session, but we shouldn't use executor since we're already
             // running on it most probably (and so we could deadlock). Use the
             // blockingExecutor instead, that's why it's for.
-            onUp(host, blockingExecutor);
+            onUp(host, preExistentConnection, blockingExecutor);
         }
 
         // Use triggerOnUp unless you're sure you want to run this on the current thread.
-        private void onUp(final Host host, ListeningExecutorService poolCreationExecutor) throws InterruptedException, ExecutionException {
+        private void onUp(final Host host, Connection preExistentConnection, ListeningExecutorService poolCreationExecutor) throws InterruptedException, ExecutionException {
             logger.debug("Host {} is UP", host);
 
             if (isClosed())
@@ -1429,79 +1428,87 @@ public class Cluster implements Closeable {
                 return;
             }
 
-            boolean locked = host.notificationsLock.tryLock(NOTIF_LOCK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            if (!locked) {
-                logger.warn("Could not acquire notifications lock within {} seconds, ignoring UP notification for {}", NOTIF_LOCK_TIMEOUT_SECONDS, host);
-                return;
-            }
             try {
 
-                // We don't want to use the public Host.isUp() as this would make us skip the rest for suspected hosts
-                if (host.state == Host.State.UP)
+                boolean locked = host.notificationsLock.tryLock(NOTIF_LOCK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                if (!locked) {
+                    logger.warn("Could not acquire notifications lock within {} seconds, ignoring UP notification for {}", NOTIF_LOCK_TIMEOUT_SECONDS, host);
                     return;
-
-                // If there is a reconnection attempt scheduled for that node, cancel it
-                Future<?> scheduledAttempt = host.reconnectionAttempt.getAndSet(null);
-                if (scheduledAttempt != null) {
-                    logger.debug("Cancelling reconnection attempt since node is UP");
-                    scheduledAttempt.cancel(false);
                 }
 
                 try {
-                    prepareAllQueries(host);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    // Don't propagate because we don't want to prevent other listener to run
-                } catch (UnsupportedProtocolVersionException e) {
-                    logUnsupportedVersionProtocol(host);
-                    return;
-                } catch (ClusterNameMismatchException e) {
-                    logClusterNameMismatch(host, e.expectedClusterName, e.actualClusterName);
-                    return;
+
+                    // We don't want to use the public Host.isUp() as this would make us skip the rest for suspected hosts
+                    if (host.state == Host.State.UP)
+                        return;
+
+                    // If there is a reconnection attempt scheduled for that node, cancel it
+                    Future<?> scheduledAttempt = host.reconnectionAttempt.getAndSet(null);
+                    if (scheduledAttempt != null) {
+                        logger.debug("Cancelling reconnection attempt since node is UP");
+                        scheduledAttempt.cancel(false);
+                    }
+
+                    try {
+                        prepareAllQueries(host);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        // Don't propagate because we don't want to prevent other listener to run
+                    } catch (UnsupportedProtocolVersionException e) {
+                        logUnsupportedVersionProtocol(host);
+                        return;
+                    } catch (ClusterNameMismatchException e) {
+                        logClusterNameMismatch(host, e.expectedClusterName, e.actualClusterName);
+                        return;
+                    }
+
+                    // Session#onUp() expects the load balancing policy to have been updated first, so that
+                    // Host distances are up to date. This mean the policy could return the node before the
+                    // new pool have been created. This is harmless if there is no prior pool since RequestHandler
+                    // will ignore the node, but we do want to make sure there is no prior pool so we don't
+                    // query from a pool we will shutdown right away.
+                    for (SessionManager s : sessions)
+                        s.removePool(host);
+                    loadBalancingPolicy().onUp(host);
+                    controlConnection.onUp(host);
+
+                    logger.trace("Adding/renewing host pools for newly UP host {}", host);
+
+                    List<ListenableFuture<Void>> futures = Lists.newArrayListWithCapacity(sessions.size());
+                    for (SessionManager s : sessions)
+                        futures.add(s.forceRenewPool(host, preExistentConnection));
+
+                    // Only mark the node up once all session have re-added their pool (if the load-balancing
+                    // policy says it should), so that Host.isUp() don't return true before we're reconnected
+                    // to the node.
+                    ListenableFuture<List<Void>> f = Futures.allAsList(futures);
+                    Futures.addCallback(f, new FutureCallback<List<Void>>() {
+                        public void onSuccess(List<Void> poolCreationResults) {
+                            host.setUp();
+
+                            for (Host.StateListener listener : listeners)
+                                listener.onUp(host);
+                        }
+
+                        public void onFailure(Throwable t) {
+                            logger.debug("Connection pool cannot be created, not marking " + host + " UP", t);
+                        }
+                    });
+
+                    f.get();
+
+                    // Now, check if there isn't pools to create/remove following the addition.
+                    // We do that now only so that it's not called before we've set the node up.
+                    for (SessionManager s : sessions)
+                        s.updateCreatedPools(blockingExecutor);
+
+                } finally {
+                    host.notificationsLock.unlock();
                 }
 
-                // Session#onUp() expects the load balancing policy to have been updated first, so that
-                // Host distances are up to date. This mean the policy could return the node before the
-                // new pool have been created. This is harmless if there is no prior pool since RequestHandler
-                // will ignore the node, but we do want to make sure there is no prior pool so we don't
-                // query from a pool we will shutdown right away.
-                for (SessionManager s : sessions)
-                    s.removePool(host);
-                loadBalancingPolicy().onUp(host);
-                controlConnection.onUp(host);
-
-                logger.trace("Adding/renewing host pools for newly UP host {}", host);
-
-                List<ListenableFuture<Void>> futures = Lists.newArrayListWithCapacity(sessions.size());
-                for (SessionManager s : sessions)
-                    futures.add(s.forceRenewPool(host, poolCreationExecutor));
-
-                // Only mark the node up once all session have re-added their pool (if the load-balancing
-                // policy says it should), so that Host.isUp() don't return true before we're reconnected
-                // to the node.
-                ListenableFuture<List<Void>> f = Futures.allAsList(futures);
-                Futures.addCallback(f, new FutureCallback<List<Void>>() {
-                    public void onSuccess(List<Void> poolCreationResults) {
-                        host.setUp();
-
-                        for (Host.StateListener listener : listeners)
-                            listener.onUp(host);
-                    }
-
-                    public void onFailure(Throwable t) {
-                        logger.debug("Connection pool cannot be created, not marking " + host + " UP", t);
-                    }
-                });
-
-                f.get();
-
-                // Now, check if there isn't pools to create/remove following the addition.
-                // We do that now only so that it's not called before we've set the node up.
-                for (SessionManager s : sessions)
-                    s.updateCreatedPools(blockingExecutor);
-
             } finally {
-                host.notificationsLock.unlock();
+                if (preExistentConnection != null && !preExistentConnection.hasPool())
+                    preExistentConnection.closeAsync();
             }
         }
 
@@ -1554,11 +1561,10 @@ public class Cluster implements Closeable {
                     public void runMayThrow() throws InterruptedException, ExecutionException {
                         boolean success;
                         try {
-                            // TODO: as for the ReconnectionHandler, we could avoid "wasting" this connection
-                            connectionFactory.open(host).closeAsync();
+                            Connection connection = connectionFactory.open(host);
                             // Note that we want to do the pool creation on this thread because we want that
                             // when onUp return, the host is ready for querying
-                            onUp(host, MoreExecutors.sameThreadExecutor());
+                            onUp(host, connection, MoreExecutors.sameThreadExecutor());
                             // If one of the connections in onUp failed, it signaled the error and triggerd onDown,
                             // but onDown aborted because this reconnection attempt was in progress (JAVA-577).
                             // Test the state now to check than onUp succeeded (we know it's up-to-date since onUp was
@@ -1640,7 +1646,6 @@ public class Cluster implements Closeable {
                 if (distance == HostDistance.IGNORED || !startReconnection)
                     return;
 
-                // Note: we basically waste the first successful reconnection, but it's probably not a big deal
                 logger.debug("{} is down, scheduling connection retries", host);
                 startPeriodicReconnectionAttempt(host, isHostAddition);
             } finally {
@@ -1656,19 +1661,15 @@ public class Cluster implements Closeable {
                 }
 
                 protected void onReconnection(Connection connection) {
-                    // We don't use that first connection so close it.
-                    // TODO: this is a bit wasteful, we should consider passing it to onAdd/onUp so
-                    // we use it for the first HostConnectionPool created
-                    connection.closeAsync();
                     // Make sure we have up-to-date infos on that host before adding it (so we typically
                     // catch that an upgraded node uses a new cassandra version).
                     if (controlConnection.refreshNodeInfo(host)) {
                         logger.debug("Successful reconnection to {}, setting host UP", host);
                         try {
                             if (isHostAddition)
-                                onAdd(host);
+                                onAdd(host, connection);
                             else
-                                onUp(host);
+                                onUp(host, connection);
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                         } catch (Exception e) {
@@ -1676,6 +1677,7 @@ public class Cluster implements Closeable {
                         }
                     } else {
                         logger.debug("Not enough info for {}, ignoring host", host);
+                        connection.closeAsync();
                     }
                 }
 
@@ -1712,16 +1714,12 @@ public class Cluster implements Closeable {
                 }
 
                 protected void onReconnection(Connection connection) {
-                    // We don't use that first connection so close it.
-                    // TODO: this is a bit wasteful, we should consider passing it to onAdd/onUp so
-                    // we use it for the first HostConnectionPool created
-                    connection.closeAsync();
                     // Make sure we have up-to-date infos on that host before adding it (so we typically
                     // catch that an upgraded node uses a new cassandra version).
                     if (controlConnection.refreshNodeInfo(host)) {
                         logger.debug("Successful reconnection to {}, setting host UP", host);
                         try {
-                            onUp(host);
+                            onUp(host, connection);
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                         } catch (Exception e) {
@@ -1729,6 +1727,7 @@ public class Cluster implements Closeable {
                         }
                     } else {
                         logger.debug("Not enough info for {}, ignoring host", host);
+                        connection.closeAsync();
                     }
                 }
 
@@ -1754,13 +1753,13 @@ public class Cluster implements Closeable {
             return executor.submit(new ExceptionCatchingRunnable() {
                 @Override
                 public void runMayThrow() throws InterruptedException, ExecutionException {
-                    onAdd(host);
+                    onAdd(host, null);
                 }
             });
         }
 
         // Use triggerOnAdd unless you're sure you want to run this on the current thread.
-        private void onAdd(final Host host) throws InterruptedException, ExecutionException {
+        private void onAdd(final Host host, Connection preExistentConnection) throws InterruptedException, ExecutionException {
             if (isClosed())
                 return;
 
@@ -1771,75 +1770,83 @@ public class Cluster implements Closeable {
                 return;
             }
 
-            boolean locked = host.notificationsLock.tryLock(NOTIF_LOCK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            if (!locked) {
-                logger.warn("Could not acquire notifications lock within {} seconds, ignoring ADD notification for {}", NOTIF_LOCK_TIMEOUT_SECONDS, host);
-                return;
-            }
             try {
 
-                // Adds to the load balancing first and foremost, as doing so might change the decision
-                // it will make for distance() on that node (not likely but we leave that possibility).
-                // This does mean the policy may start returning that node for query plan, but as long
-                // as no pools have been created (below) this will be ignored by RequestHandler so it's fine.
-                loadBalancingPolicy().onAdd(host);
-
-                // Next, if the host should be ignored, well, ignore it.
-                if (loadBalancingPolicy().distance(host) == HostDistance.IGNORED) {
-                    // We still mark the node UP though as it should be (and notifiy the listeners).
-                    // We'll mark it down if we have  a notification anyway and we've documented that especially
-                    // for IGNORED hosts, the isUp() method was a best effort guess
-                    host.setUp();
-                    for (Host.StateListener listener : listeners)
-                        listener.onAdd(host);
+                boolean locked = host.notificationsLock.tryLock(NOTIF_LOCK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                if (!locked) {
+                    logger.warn("Could not acquire notifications lock within {} seconds, ignoring ADD notification for {}", NOTIF_LOCK_TIMEOUT_SECONDS, host);
                     return;
                 }
 
                 try {
-                    prepareAllQueries(host);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    // Don't propagate because we don't want to prevent other listener to run
-                } catch (UnsupportedProtocolVersionException e) {
-                    logUnsupportedVersionProtocol(host);
-                    return;
-                } catch (ClusterNameMismatchException e) {
-                    logClusterNameMismatch(host, e.expectedClusterName, e.actualClusterName);
-                    return;
-                }
 
-                controlConnection.onAdd(host);
+                    // Adds to the load balancing first and foremost, as doing so might change the decision
+                    // it will make for distance() on that node (not likely but we leave that possibility).
+                    // This does mean the policy may start returning that node for query plan, but as long
+                    // as no pools have been created (below) this will be ignored by RequestHandler so it's fine.
+                    loadBalancingPolicy().onAdd(host);
 
-                List<ListenableFuture<Void>> futures = Lists.newArrayListWithCapacity(sessions.size());
-                for (SessionManager s : sessions)
-                    futures.add(s.maybeAddPool(host, blockingExecutor));
-
-                // Only mark the node up once all session have added their pool (if the load-balancing
-                // policy says it should), so that Host.isUp() don't return true before we're reconnected
-                // to the node.
-                ListenableFuture<List<Void>> f = Futures.allAsList(futures);
-                Futures.addCallback(f, new FutureCallback<List<Void>>() {
-                    public void onSuccess(List<Void> poolCreationResults) {
+                    // Next, if the host should be ignored, well, ignore it.
+                    if (loadBalancingPolicy().distance(host) == HostDistance.IGNORED) {
+                        // We still mark the node UP though as it should be (and notifiy the listeners).
+                        // We'll mark it down if we have  a notification anyway and we've documented that especially
+                        // for IGNORED hosts, the isUp() method was a best effort guess
                         host.setUp();
-
                         for (Host.StateListener listener : listeners)
                             listener.onAdd(host);
+                        return;
                     }
 
-                    public void onFailure(Throwable t) {
-                        logger.debug("Connection pool cannot be created, not marking " + host + " UP", t);
+                    try {
+                        prepareAllQueries(host);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        // Don't propagate because we don't want to prevent other listener to run
+                    } catch (UnsupportedProtocolVersionException e) {
+                        logUnsupportedVersionProtocol(host);
+                        return;
+                    } catch (ClusterNameMismatchException e) {
+                        logClusterNameMismatch(host, e.expectedClusterName, e.actualClusterName);
+                        return;
                     }
-                });
 
-                f.get();
+                    controlConnection.onAdd(host);
 
-                // Now, check if there isn't pools to create/remove following the addition.
-                // We do that now only so that it's not called before we've set the node up.
-                for (SessionManager s : sessions)
-                    s.updateCreatedPools(blockingExecutor);
+                    List<ListenableFuture<Void>> futures = Lists.newArrayListWithCapacity(sessions.size());
+                    for (SessionManager s : sessions)
+                        futures.add(s.maybeAddPool(host, preExistentConnection, blockingExecutor));
+
+                    // Only mark the node up once all session have added their pool (if the load-balancing
+                    // policy says it should), so that Host.isUp() don't return true before we're reconnected
+                    // to the node.
+                    ListenableFuture<List<Void>> f = Futures.allAsList(futures);
+                    Futures.addCallback(f, new FutureCallback<List<Void>>() {
+                        public void onSuccess(List<Void> poolCreationResults) {
+                            host.setUp();
+
+                            for (Host.StateListener listener : listeners)
+                                listener.onAdd(host);
+                        }
+
+                        public void onFailure(Throwable t) {
+                            logger.debug("Connection pool cannot be created, not marking " + host + " UP", t);
+                        }
+                    });
+
+                    f.get();
+
+                    // Now, check if there isn't pools to create/remove following the addition.
+                    // We do that now only so that it's not called before we've set the node up.
+                    for (SessionManager s : sessions)
+                        s.updateCreatedPools(blockingExecutor);
+
+                } finally {
+                    host.notificationsLock.unlock();
+                }
 
             } finally {
-                host.notificationsLock.unlock();
+                if (preExistentConnection != null && !preExistentConnection.hasPool())
+                    preExistentConnection.closeAsync();
             }
         }
 
@@ -2071,7 +2078,7 @@ public class Cluster implements Closeable {
                                         // Make sure we have up-to-date infos on that host before adding it (so we typically
                                         // catch that an upgraded node uses a new cassandra version).
                                         if (controlConnection.refreshNodeInfo(newHost)) {
-                                            onAdd(newHost);
+                                            onAdd(newHost, null);
                                         } else {
                                             logger.debug("Not enough info for {}, ignoring host", newHost);
                                         }
@@ -2113,7 +2120,7 @@ public class Cluster implements Closeable {
                                         // Make sure we have up-to-date infos on that host before adding it (so we typically
                                         // catch that an upgraded node uses a new cassandra version).
                                         if (controlConnection.refreshNodeInfo(h)) {
-                                            onAdd(h);
+                                            onAdd(h, null);
                                         } else {
                                             logger.debug("Not enough info for {}, ignoring host", h);
                                         }
@@ -2126,7 +2133,7 @@ public class Cluster implements Closeable {
                                         // Make sure we have up-to-date infos on that host before adding it (so we typically
                                         // catch that an upgraded node uses a new cassandra version).
                                         if (controlConnection.refreshNodeInfo(hostUp)) {
-                                            onUp(hostUp);
+                                            onUp(hostUp, null);
                                         } else {
                                             logger.debug("Not enough info for {}, ignoring host", hostUp);
                                         }
