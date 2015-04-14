@@ -162,9 +162,6 @@ public class QueryLogger implements LatencyTracker {
     @VisibleForTesting
     static final String FURTHER_PARAMS_OMITTED = " [further parameters omitted]";
 
-    @VisibleForTesting
-    static final String UNKNOWN_STATEMENT = "??Unknown Statement??";
-
     private final Cluster cluster;
 
     private volatile long slowQueryLatencyThresholdMillis = DEFAULT_SLOW_QUERY_THRESHOLD_MS;
@@ -431,6 +428,9 @@ public class QueryLogger implements LatencyTracker {
     private void logQuery(Host host, Statement statement, Exception exception, long latencyMs, Logger logger, String template) {
         if (logger.isDebugEnabled()) {
             String message = String.format(template, cluster.getClusterName(), host, latencyMs, statementAsString(statement));
+            if(statement instanceof BatchStatement) {
+                message += " [" + ((BatchStatement)statement).getStatements().size() + " statements total]";
+            }
             boolean showParameterValues = logger.isTraceEnabled();
             if (showParameterValues) {
                 StringBuilder params = new StringBuilder();
@@ -541,8 +541,9 @@ public class QueryLogger implements LatencyTracker {
             }
             remaining = append(" APPLY BATCH", buffer, remaining);
         } else {
-            // Unknown types of statement - should not happen
-            remaining = append(UNKNOWN_STATEMENT, buffer, remaining);
+            // Unknown types of statement
+            // Call toString() as a last resort
+            remaining = append(statement.toString(), buffer, remaining);
         }
         if (buffer.charAt(buffer.length() - 1) != ';') {
             remaining = append(";", buffer, remaining);
@@ -551,16 +552,17 @@ public class QueryLogger implements LatencyTracker {
     }
 
     private int append(CharSequence str, StringBuilder buffer, int remaining) {
-        if (remaining == -1) {
+        if (remaining == -2) {
+            // capacity exceeded
+        } else if (remaining == -1) {
+            // unlimited capacity
             buffer.append(str);
-        } else if (remaining > 0) {
-            if (str.length() > remaining) {
-                buffer.append(str, 0, remaining).append(TRUNCATED_OUTPUT);
-                remaining = 0;
-            } else {
-                buffer.append(str);
-                remaining -= str.length();
-            }
+        } else if (str.length() > remaining) {
+            buffer.append(str, 0, remaining).append(TRUNCATED_OUTPUT);
+            remaining = -2;
+        } else {
+            buffer.append(str);
+            remaining -= str.length();
         }
         return remaining;
     }
