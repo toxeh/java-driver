@@ -37,9 +37,15 @@ public class QueryOptions {
      */
     public static final int DEFAULT_FETCH_SIZE = 5000;
 
+    /**
+     * The default value for {@link #getDefaultIdempotency()}: {@code false}.
+     */
+    public static final boolean DEFAULT_IDEMPOTENCY = false;
+
     private volatile ConsistencyLevel consistency = DEFAULT_CONSISTENCY_LEVEL;
     private volatile ConsistencyLevel serialConsistency = DEFAULT_SERIAL_CONSISTENCY_LEVEL;
     private volatile int fetchSize = DEFAULT_FETCH_SIZE;
+    private volatile boolean defaultIdempotency = DEFAULT_IDEMPOTENCY;
     private volatile Cluster.Manager manager;
 
     /**
@@ -137,5 +143,30 @@ public class QueryOptions {
      */
     public int getFetchSize() {
         return fetchSize;
+    }
+
+    /**
+     * Sets the default idempotency for queries.
+     * <p>
+     * This will be used for statements for which {@link com.datastax.driver.core.Statement#isIdempotent()}
+     * returns {@code null}.
+     *
+     * @param defaultIdempotency the new value to set as default idempotency.
+     * @return this {@code QueryOptions} instance.
+     */
+    public QueryOptions setDefaultIdempotency(boolean defaultIdempotency) {
+        this.defaultIdempotency = defaultIdempotency;
+        return this;
+    }
+
+    /**
+     * The default idempotency for queries.
+     * <p>
+     * It defaults to {@link #DEFAULT_IDEMPOTENCY}.
+     *
+     * @return the default idempotency for queries.
+     */
+    public boolean getDefaultIdempotency() {
+        return defaultIdempotency;
     }
 }

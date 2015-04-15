@@ -38,6 +38,7 @@ public class SpeculativeExecutionTest {
             .addContactPoint(CCMBridge.ipOfNode(2))
             .withLoadBalancingPolicy(loadBalancingPolicy)
             .withSpeculativeExecutionPolicy(new ConstantSpeculativeExecutionPolicy(1, speculativeExecutionDelay))
+            .withQueryOptions(new QueryOptions().setDefaultIdempotency(true))
             .withRetryPolicy(new CustomRetryPolicy())
             .build();
 

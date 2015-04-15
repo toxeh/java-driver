@@ -49,6 +49,7 @@ class RequestHandler {
 
     private final Iterator<Host> queryPlan;
     private final SpeculativeExecutionPlan speculativeExecutionPlan;
+    private final boolean allowSpeculativeExecutions;
     private final Set<SpeculativeExecution> runningExecutions = Sets.newCopyOnWriteArraySet();
     private final Set<Timeout> scheduledExecutions = Sets.newCopyOnWriteArraySet();
     private final Statement statement;
@@ -78,6 +79,7 @@ class RequestHandler {
 
         this.queryPlan = manager.loadBalancingPolicy().newQueryPlan(manager.poolsState.keyspace, statement);
         this.speculativeExecutionPlan = manager.speculativeRetryPolicy().newPlan(manager.poolsState.keyspace, statement);
+        this.allowSpeculativeExecutions = statement.isIdempotentWithDefault(manager.configuration().getQueryOptions());
         this.statement = statement;
 
         this.timerContext = metricsEnabled()
@@ -262,7 +264,7 @@ class RequestHandler {
             if (currentPool == null || currentPool.isClosed())
                 return false;
 
-            if (nextExecutionScheduled.compareAndSet(false, true))
+            if (allowSpeculativeExecutions && nextExecutionScheduled.compareAndSet(false, true))
                 scheduleExecution(speculativeExecutionPlan.nextExecution(host));
 
             PooledConnection connection = null;
